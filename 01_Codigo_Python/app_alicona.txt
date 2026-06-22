@@ -1,0 +1,661 @@
+"""
+=============================================================================
+Trabajo de Fin de Grado: Mecanizado de aleaciones refractarias (LMD)
+Autor: Jorge Valladolid Blas
+Script: app_alicona.py
+Descripción: Aplicación con interfaz gráfica (GUI) desarrollada en Python para 
+             la extracción automatizada, análisis estadístico y representación 
+             gráfica de parámetros de topografía superficial obtenidos mediante 
+             metrología óptica (ALICONA). Genera reportes inteligentes en Excel 
+             y PDF aplicando tolerancias de calidad geométrica.
+=============================================================================
+"""
+
+# Librerías estándar
+import os
+import re
+import json
+import threading
+from datetime import datetime
+
+# Librerías de análisis de datos y gráficos
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from openpyxl.styles import PatternFill
+
+# Librerías de interfaz y extracción
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import pdfplumber
+
+# Configuración del entorno gráfico
+ctk.set_appearance_mode("dark")  
+ctk.set_default_color_theme("blue") 
+
+class AliconaApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # Configuración de la ventana principal
+        self.title("Extractor de Rugosidades ALICONA - Metrología Óptica")
+        self.geometry("700x920") 
+        
+        # Variables de estado
+        self.archivo_memoria = "memoria_alicona.json"
+        self.carpeta_origen = ""
+        self.archivo_destino = ""
+        self.df_resumen_actual = None
+        self.columnas_extraidas = []
+
+        # Diccionario maestro de expresiones regulares (Regex) para parámetros de rugosidad
+        self.patrones_maestros = {
+            "Ra": r"Ra[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Rz": r"Rz[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Rq": r"Rq[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Rt": r"Rt[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Sa": r"Sa[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Sz": r"Sz[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Ssk": r"Ssk[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Sv": r"Sv[\s:=]+([-+]?[0-9]+[.,][0-9]+)", 
+            "Std": r"Std[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Str": r"Str[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Sku": r"Sku[\s:=]+([-+]?[0-9]+[.,][0-9]+)",
+            "Svk": r"Svk[\s:=]+([-+]?[0-9]+[.,][0-9]+)"
+        }
+        
+        self.tolerancias_max = {} 
+        self.estado_casillas = {} 
+        
+        # Inicialización
+        self.cargar_memoria()
+        self.crear_interfaz()
+        self.protocol("WM_DELETE_WINDOW", self.cerrar_y_guardar)
+
+    # -------------------------------------------------------------------------
+    # GESTIÓN DE MEMORIA (Persistencia de datos)
+    # -------------------------------------------------------------------------
+    def cargar_memoria(self):
+        """Carga las configuraciones y rutas guardadas en la sesión anterior."""
+        if os.path.exists(self.archivo_memoria):
+            try:
+                with open(self.archivo_memoria, "r", encoding="utf-8") as f:
+                    memoria = json.load(f)
+                    self.carpeta_origen = memoria.get("carpeta", "")
+                    self.archivo_destino = memoria.get("destino", "")
+                    patrones_guardados = memoria.get("patrones", {})
+                    self.patrones_maestros.update(patrones_guardados)
+                    self.estado_casillas = memoria.get("casillas", {})
+                    self.tolerancias_max = memoria.get("tolerancias", {}) 
+            except Exception as e:
+                print(f"No se pudo cargar la memoria: {e}")
+
+    def cerrar_y_guardar(self):
+        """Guarda el estado de la interfaz antes de cerrar la aplicación."""
+        estados_actuales = {}
+        for param, var in self.checkboxes.items():
+            estados_actuales[param] = var.get()
+
+        memoria = {
+            "carpeta": self.carpeta_origen,
+            "destino": self.archivo_destino,
+            "patrones": self.patrones_maestros,
+            "casillas": estados_actuales,
+            "tolerancias": self.tolerancias_max 
+        }
+        
+        try:
+            with open(self.archivo_memoria, "w", encoding="utf-8") as f:
+                json.dump(memoria, f, indent=4)
+        except Exception as e:
+            print(f"Error al guardar memoria: {e}")
+            
+        self.destroy() 
+
+    # -------------------------------------------------------------------------
+    # CONSTRUCCIÓN DE LA INTERFAZ GRÁFICA (GUI)
+    # -------------------------------------------------------------------------
+    def crear_interfaz(self):
+        """Genera y empaqueta los elementos visuales de la aplicación."""
+        # Cabecera
+        self.frame_cabecera = ctk.CTkFrame(self, fg_color="transparent")
+        self.frame_cabecera.pack(pady=15, padx=20, fill="x")
+        
+        self.lbl_titulo = ctk.CTkLabel(self.frame_cabecera, text="Laboratorio: Análisis ALICONA", 
+                                       font=ctk.CTkFont(size=20, weight="bold"))
+        self.lbl_titulo.pack(side="left")
+
+        self.switch_tema = ctk.CTkSwitch(self.frame_cabecera, text="Modo Oscuro", command=self.cambiar_tema)
+        self.switch_tema.pack(side="right")
+        self.switch_tema.select() 
+
+        self.btn_manual = ctk.CTkButton(self.frame_cabecera, text="📖 Manual", width=80, fg_color="transparent", 
+                                        border_width=1, text_color=("black", "white"), command=self.abrir_manual)
+        self.btn_manual.pack(side="right", padx=15)
+
+        # Selección de rutas
+        self.frame_rutas = ctk.CTkFrame(self)
+        self.frame_rutas.pack(pady=10, padx=20, fill="x")
+
+        self.btn_carpeta = ctk.CTkButton(self.frame_rutas, text="1. Seleccionar Carpeta PDFs", 
+                                         command=self.seleccionar_carpeta)
+        self.btn_carpeta.grid(row=0, column=0, padx=10, pady=10)
+        
+        texto_carpeta = self.carpeta_origen if self.carpeta_origen else "Ninguna carpeta seleccionada"
+        self.lbl_carpeta = ctk.CTkLabel(self.frame_rutas, text=texto_carpeta)
+        self.lbl_carpeta.grid(row=0, column=1, padx=10, pady=10, sticky="w")
+
+        self.btn_guardar = ctk.CTkButton(self.frame_rutas, text="2. Dónde guardar el Excel", 
+                                         command=self.seleccionar_destino)
+        self.btn_guardar.grid(row=1, column=0, padx=10, pady=10)
+
+        texto_destino = self.archivo_destino if self.archivo_destino else "Ningún archivo destino"
+        self.lbl_guardar = ctk.CTkLabel(self.frame_rutas, text=texto_destino)
+        self.lbl_guardar.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+
+        # Configuración de parámetros
+        self.frame_titulo_params = ctk.CTkFrame(self, fg_color="transparent")
+        self.frame_titulo_params.pack(pady=(15, 5), padx=20, fill="x")
+        
+        self.lbl_params = ctk.CTkLabel(self.frame_titulo_params, text="Parámetros topográficos a extraer:", 
+                                       font=ctk.CTkFont(weight="bold"))
+        self.lbl_params.pack(side="left")
+        
+        self.btn_tolerancias = ctk.CTkButton(self.frame_titulo_params, text="⚙️ Límites / Tolerancias", 
+                                             width=120, fg_color="#D2691E", hover_color="#8B4513", 
+                                             command=self.abrir_ventana_tolerancias)
+        self.btn_tolerancias.pack(side="right")
+
+        # Añadir parámetros dinámicos
+        self.frame_nuevo_param = ctk.CTkFrame(self, fg_color="transparent")
+        self.frame_nuevo_param.pack(pady=0, padx=20, fill="x")
+        
+        self.entrada_parametro = ctk.CTkEntry(self.frame_nuevo_param, placeholder_text="Ej: Sp", width=120)
+        self.entrada_parametro.pack(side="left", padx=(0, 10))
+        
+        self.btn_anadir_param = ctk.CTkButton(self.frame_nuevo_param, text="+ Añadir Parámetro", 
+                                              width=120, command=self.anadir_parametro_dinamico)
+        self.btn_anadir_param.pack(side="left")
+
+        self.frame_params = ctk.CTkFrame(self)
+        self.frame_params.pack(pady=10, padx=20, fill="x")
+
+        self.checkboxes = {}
+        self.chk_fila = 0
+        self.chk_columna = 0
+        
+        for parametro in self.patrones_maestros.keys():
+            valor_recordado = self.estado_casillas.get(parametro, 1) 
+            self.dibujar_checkbox(parametro, valor_recordado)
+
+        # Barra de progreso y controles de ejecución
+        self.barra_progreso = ctk.CTkProgressBar(self, mode="determinate")
+        self.barra_progreso.pack(pady=(15, 5), padx=20, fill="x")
+        self.barra_progreso.set(0) 
+        self.barra_progreso.pack_forget() 
+
+        self.lbl_progreso = ctk.CTkLabel(self, text="", text_color="gray")
+        self.lbl_progreso.pack()
+        self.lbl_progreso.pack_forget()
+
+        self.btn_ejecutar = ctk.CTkButton(self, text="3. INICIAR EXTRACCIÓN", fg_color="green", 
+                                          hover_color="darkgreen", font=ctk.CTkFont(weight="bold"), 
+                                          command=self.iniciar_extraccion)
+        self.btn_ejecutar.pack(pady=10)
+
+        # Herramientas de visualización y reportes (Post-procesado)
+        self.frame_herramientas = ctk.CTkFrame(self, fg_color="transparent")
+        self.frame_herramientas.pack(pady=5, padx=20, fill="x")
+        
+        self.combo_parametros = ctk.CTkComboBox(self.frame_herramientas, values=["---"], state="disabled", width=80)
+        self.combo_parametros.pack(side="left", padx=(0, 5))
+
+        self.btn_grafico = ctk.CTkButton(self.frame_herramientas, text="📊 Gráfico", width=80, 
+                                         state="disabled", command=self.mostrar_grafico)
+        self.btn_grafico.pack(side="left")
+
+        self.btn_pdf = ctk.CTkButton(self.frame_herramientas, text="📄 Crear PDF", width=100, 
+                                     fg_color="#B22222", hover_color="#8B0000", state="disabled", 
+                                     command=self.generar_pdf)
+        self.btn_pdf.pack(side="left", padx=(5,0))
+
+        self.btn_abrir_carpeta_dest = ctk.CTkButton(self.frame_herramientas, text="📁 Ver Archivos", 
+                                                    width=100, fg_color="#4682B4", hover_color="#4169E1", 
+                                                    state="disabled", command=self.abrir_carpeta_destino)
+        self.btn_abrir_carpeta_dest.pack(side="right")
+
+        self.btn_abrir_excel = ctk.CTkButton(self.frame_herramientas, text="📂 Abrir Excel", width=100, 
+                                             fg_color="#8B008B", hover_color="#4B0082", state="disabled", 
+                                             command=self.abrir_excel)
+        self.btn_abrir_excel.pack(side="right", padx=(0, 5))
+
+        # Consola de registro (Log)
+        self.caja_texto = ctk.CTkTextbox(self, height=120)
+        self.caja_texto.pack(pady=10, padx=20, fill="both", expand=True)
+        self.registrar_log("Sistema inicializado correctamente. Esperando instrucciones...")
+
+    # -------------------------------------------------------------------------
+    # FUNCIONES DE INTERFAZ Y EVENTOS AUXILIARES
+    # -------------------------------------------------------------------------
+    def abrir_ventana_tolerancias(self):
+        """Abre el panel de configuración de tolerancias máximas para control de calidad."""
+        ventana = ctk.CTkToplevel(self)
+        ventana.title("Configurar Tolerancias Máximas")
+        ventana.geometry("350x500")
+        ventana.attributes("-topmost", True)
+        
+        lbl_info = ctk.CTkLabel(ventana, text="Establecer valores límite para el control de calidad.\n"
+                                              "Dejar en blanco si el parámetro no tiene restricción.", 
+                                font=ctk.CTkFont(weight="bold"))
+        lbl_info.pack(pady=10)
+
+        marco_scroll = ctk.CTkScrollableFrame(ventana)
+        marco_scroll.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.entradas_tolerancia = {}
+        
+        for parametro in self.patrones_maestros.keys():
+            fila = ctk.CTkFrame(marco_scroll, fg_color="transparent")
+            fila.pack(fill="x", pady=2)
+            
+            lbl = ctk.CTkLabel(fila, text=f"{parametro} (Máx):", width=80, anchor="w")
+            lbl.pack(side="left", padx=5)
+            
+            entrada = ctk.CTkEntry(fila, width=100)
+            entrada.pack(side="left")
+            
+            if parametro in self.tolerancias_max:
+                entrada.insert(0, str(self.tolerancias_max[parametro]))
+                
+            self.entradas_tolerancia[parametro] = entrada
+
+        btn_guardar = ctk.CTkButton(ventana, text="Guardar Tolerancias", fg_color="green", 
+                                    command=lambda: self.guardar_tolerancias(ventana))
+        btn_guardar.pack(pady=15)
+
+    def guardar_tolerancias(self, ventana):
+        """Valida y guarda en memoria las tolerancias definidas por el usuario."""
+        self.tolerancias_max.clear()
+        for param, entrada in self.entradas_tolerancia.items():
+            valor = entrada.get().strip().replace(',', '.')
+            if valor: 
+                try:
+                    self.tolerancias_max[param] = float(valor)
+                except ValueError:
+                    messagebox.showerror("Error de validación", f"El valor introducido en '{param}' no es numérico.")
+                    return
+        
+        self.registrar_log("⚙️ Nuevas tolerancias establecidas en memoria.")
+        ventana.destroy()
+
+    def generar_pdf(self):
+        """Genera un reporte PDF con el análisis estadístico gráfico de todas las variables."""
+        if self.df_resumen_actual is None:
+            return
+             
+        ruta_pdf = self.archivo_destino.replace(".xlsx", "_Informe_Topografico.pdf")
+        self.registrar_log("\nGenerando Informe PDF...")
+        self.btn_pdf.configure(state="disabled", text="Creando...")
+        self.update()
+
+        try:
+            with PdfPages(ruta_pdf) as pdf:
+                for parametro in self.columnas_extraidas:
+                    columna_media = f"{parametro} (Media)" 
+                    datos_limpios = self.df_resumen_actual.dropna(subset=[columna_media])
+                    
+                    if datos_limpios.empty:
+                        continue 
+                        
+                    zonas = datos_limpios["Zona / Carpeta"]
+                    medias = datos_limpios[columna_media]
+                    
+                    fig = plt.figure(figsize=(10, 6))
+                    barras = plt.bar(zonas, medias, color='#4da6ff', edgecolor='black', linewidth=1.2)
+                    
+                    for barra in barras:
+                        yval = barra.get_height()
+                        plt.text(barra.get_x() + barra.get_width() / 2, yval, 
+                                 round(yval, 3), ha='center', va='bottom', 
+                                 fontsize=10, fontweight='bold')
+                    
+                    # Trazado de límite de tolerancia si existe
+                    if parametro in self.tolerancias_max:
+                        limite = self.tolerancias_max[parametro]
+                        plt.axhline(y=limite, color='r', linestyle='--', linewidth=2, 
+                                    label=f'Límite Máx ({limite} µm)')
+                        plt.legend()
+                    
+                    plt.title(f"Análisis del parámetro topográfico '{parametro}' por zonas de mecanizado", 
+                              fontsize=14, fontweight='bold')
+                    plt.xlabel("Zonas Analizadas", fontsize=12)
+                    plt.ylabel(f"Valor Medio Registrado", fontsize=12)
+                    plt.xticks(rotation=45, ha='right') 
+                    plt.grid(axis='y', linestyle='--', alpha=0.7) 
+                    plt.tight_layout() 
+                    
+                    pdf.savefig(fig) 
+                    plt.close(fig) 
+            
+            self.registrar_log(f"¡PDF Generado con éxito!\nRuta: {ruta_pdf}")
+            messagebox.showinfo("Informe PDF", f"El informe técnico ha sido generado correctamente:\n\n{ruta_pdf}")
+            
+        except Exception as e:
+            self.registrar_log(f"[X] Error durante la creación del documento PDF: {e}")
+            messagebox.showerror("Error Crítico", f"Fallo al compilar el informe en PDF:\n{e}")
+            
+        self.btn_pdf.configure(state="normal", text="📄 Crear PDF")
+
+    def abrir_manual(self):
+        ventana_manual = ctk.CTkToplevel(self)
+        ventana_manual.title("Manual de Instrucciones")
+        ventana_manual.geometry("550x650")
+        ventana_manual.attributes("-topmost", True) 
+        
+        texto_manual = ctk.CTkTextbox(ventana_manual, wrap="word", font=ctk.CTkFont(size=13))
+        texto_manual.pack(fill="both", expand=True, padx=15, pady=15)
+        
+        instrucciones = """📚 MANUAL DE USO - Extractor de datos ALICONA
+
+1️⃣ CARPETAS:
+El algoritmo agrupará los datos estadísticos basándose en las subcarpetas contenidas en el directorio raíz seleccionado.
+
+2️⃣ CONTROL DE CALIDAD (TOLERANCIAS):
+En "⚙️ Límites / Tolerancias" se pueden definir los valores máximos de rugosidad permitidos. 
+Durante la generación del documento Excel, la matriz de resultados evaluará estos límites, coloreando las celdas automáticamente: Verde (Aprobado) o Rojo (Fallo).
+
+3️⃣ EJECUCIÓN:
+Selecciona los parámetros métricos a evaluar. El sistema creará una auto-nomenclatura basada en la fecha actual para el archivo de salida. Asegúrese de que el Excel destino no esté abierto.
+
+4️⃣ RESULTADOS Y POST-PROCESADO:
+- 📊 Gráfico: Renderiza un diagrama de barras interactivo del parámetro seleccionado.
+- 📄 Crear PDF: Consolida todos los gráficos y tolerancias en un informe técnico integral.
+- 📂 Abrir Excel: Abre el archivo generado con las macros de color ya aplicadas.
+- 📁 Ver Archivos: Abre el explorador de Windows en la ruta de trabajo."""
+        
+        texto_manual.insert("0.0", instrucciones)
+        texto_manual.configure(state="disabled") 
+
+    def cambiar_tema(self):
+        if self.switch_tema.get() == 1:
+            ctk.set_appearance_mode("dark")
+        else:
+            ctk.set_appearance_mode("light")
+
+    def abrir_excel(self):
+        try:
+            os.startfile(self.archivo_destino)
+            self.registrar_log("Abriendo hoja de cálculo de resultados...")
+        except Exception as e:
+            messagebox.showerror("Error de lectura", f"No se pudo localizar el archivo Excel:\n{e}")
+
+    def abrir_carpeta_destino(self):
+        try:
+            if self.archivo_destino:
+                carpeta = os.path.dirname(self.archivo_destino)
+                os.startfile(carpeta)
+                self.registrar_log("Abriendo directorio de exportación...")
+        except Exception as e:
+            messagebox.showerror("Error de sistema", f"Fallo al abrir el explorador de archivos:\n{e}")
+
+    def anadir_parametro_dinamico(self):
+        nuevo_param = self.entrada_parametro.get().strip() 
+        if not nuevo_param: 
+            return
+        if nuevo_param in self.patrones_maestros: 
+            return
+            
+        self.patrones_maestros[nuevo_param] = rf"{nuevo_param}[\s:=]+([-+]?[0-9]+[.,][0-9]+)"
+        self.dibujar_checkbox(nuevo_param, 1)
+        self.entrada_parametro.delete(0, 'end')
+        self.registrar_log(f"-> Nuevo parámetro analítico añadido: {nuevo_param}")
+
+    def dibujar_checkbox(self, parametro, valor_inicial):
+        var = ctk.IntVar(value=valor_inicial) 
+        chk = ctk.CTkCheckBox(self.frame_params, text=parametro, variable=var)
+        chk.grid(row=self.chk_fila, column=self.chk_columna, padx=15, pady=10, sticky="w")
+        self.checkboxes[parametro] = var
+        
+        self.chk_columna += 1
+        if self.chk_columna > 3:
+            self.chk_columna = 0
+            self.chk_fila += 1
+
+    def registrar_log(self, mensaje):
+        self.caja_texto.insert("end", mensaje + "\n")
+        self.caja_texto.see("end") 
+
+    def seleccionar_carpeta(self):
+        directorio_inicial = self.carpeta_origen if self.carpeta_origen else "/"
+        ruta = filedialog.askdirectory(title="Selecciona el directorio raíz con los informes Alicona (PDF)", 
+                                       initialdir=directorio_inicial)
+        if ruta:
+            self.carpeta_origen = ruta
+            self.lbl_carpeta.configure(text=ruta)
+
+    def seleccionar_destino(self):
+        # Auto-Nomenclatura basada en la fecha actual
+        fecha_str = datetime.now().strftime("%d-%m-%Y")
+        nombre_sugerido = f"Reporte_Topografico_{fecha_str}.xlsx"
+        
+        if self.carpeta_origen:
+            nombre_carpeta = os.path.basename(self.carpeta_origen)
+            nombre_sugerido = f"Analisis_{nombre_carpeta}_{fecha_str}.xlsx"
+            
+        directorio_inicial = os.path.dirname(self.archivo_destino) if self.archivo_destino else "/"
+
+        ruta = filedialog.asksaveasfilename(
+            title="Guardar base de datos como...",
+            defaultextension=".xlsx",
+            filetypes=[("Archivos Excel", "*.xlsx")],
+            initialdir=directorio_inicial,
+            initialfile=nombre_sugerido 
+        )
+        if ruta:
+            self.archivo_destino = ruta
+            self.lbl_guardar.configure(text=ruta)
+
+    # -------------------------------------------------------------------------
+    # NÚCLEO DE EXTRACCIÓN Y PROCESAMIENTO (DATA MINING)
+    # -------------------------------------------------------------------------
+    def extraer_datos_pdf(self, ruta_pdf, patrones):
+        """Busca valores numéricos en el texto del PDF basándose en Regex."""
+        valores = {}
+        try:
+            with pdfplumber.open(ruta_pdf) as pdf:
+                texto_completo = "".join([p.extract_text() or "" for p in pdf.pages])
+                for param, patron in patrones.items():
+                    coin = re.search(patron, texto_completo)
+                    # Normalizamos los decimales europeos (coma a punto)
+                    valores[param] = float(coin.group(1).replace(',', '.')) if coin else None 
+        except Exception: 
+            pass
+        return valores
+
+    def iniciar_extraccion(self):
+        """Verifica restricciones y lanza el hilo de ejecución en segundo plano."""
+        if not self.carpeta_origen or not self.archivo_destino: 
+            return
+            
+        if os.path.exists(self.archivo_destino):
+            try: 
+                open(self.archivo_destino, 'a').close()
+            except PermissionError:
+                messagebox.showerror("Archivo en Uso", "El archivo Excel se encuentra abierto. Debe cerrarlo para actualizar los datos.")
+                return
+
+        patrones_a_buscar = {p: self.patrones_maestros[p] for p, v in self.checkboxes.items() if v.get() == 1}
+        if not patrones_a_buscar: 
+            return
+
+        self.btn_ejecutar.configure(state="disabled", text="PROCESANDO DATOS...")
+        self.btn_pdf.configure(state="disabled")
+        self.btn_abrir_excel.configure(state="disabled")
+        self.btn_abrir_carpeta_dest.configure(state="disabled") 
+        
+        self.registrar_log("\n--- INICIANDO EXTRACCIÓN METROLÓGICA ---")
+        self.barra_progreso.pack(pady=(15, 5), padx=20, fill="x", before=self.btn_ejecutar)
+        self.lbl_progreso.pack(before=self.btn_ejecutar)
+        self.barra_progreso.set(0)
+
+        # Usamos threading para evitar que la interfaz gráfica se congele durante la lectura masiva
+        threading.Thread(target=self.procesar_pdfs_hilo, args=(patrones_a_buscar,), daemon=True).start()
+
+    def procesar_pdfs_hilo(self, patrones):
+        """Lógica principal de iteración, cálculos estadísticos y exportación a Pandas/Excel."""
+        lista_resultados = []
+        archivos_totales = [os.path.join(r, a) for r, _, a in os.walk(self.carpeta_origen) 
+                            for a in a if a.lower().endswith(".pdf")]
+        total_pdfs = len(archivos_totales)
+
+        if total_pdfs == 0:
+            self.after(0, lambda: self.finalizar_extraccion(False, "No se hallaron archivos PDF en la ruta indicada."))
+            return
+
+        # Fase 1: Lectura y Extracción
+        for indice, ruta_completa in enumerate(archivos_totales):
+            archivo = os.path.basename(ruta_completa)
+            ruta_relativa = os.path.relpath(ruta_completa, self.carpeta_origen)
+            partes_ruta = os.path.normpath(ruta_relativa).split(os.sep)
+            nombre_carpeta = partes_ruta[0] if len(partes_ruta) > 1 else "Archivos Raíz"
+            
+            self.after(0, lambda p=archivo: self.registrar_log(f"Procesando: {p}"))
+            self.after(0, lambda p=(indice + 1) / total_pdfs, 
+                              t=f"Evaluando matriz {indice + 1}/{total_pdfs}": self.actualizar_barra(p, t))
+            
+            datos = self.extraer_datos_pdf(ruta_completa, patrones)
+            fila = {"Zona / Carpeta": nombre_carpeta, "Nombre del Archivo": archivo}
+            fila.update(datos)
+            lista_resultados.append(fila)
+
+        # Fase 2: Cálculos Estadísticos y Volcado
+        if lista_resultados:
+            self.after(0, lambda: self.registrar_log("\nGenerando matriz de resultados y aplicando heurística de tolerancias..."))
+            df_bruto = pd.DataFrame(lista_resultados).sort_values(by=["Zona / Carpeta", "Nombre del Archivo"])
+            columnas_num = list(patrones.keys())
+            
+            # Cálculo de medias y desviaciones estándar
+            df_resumen = df_bruto.groupby("Zona / Carpeta")[columnas_num].agg(['mean', 'std']).reset_index()
+            nuevas_columnas = ["Zona / Carpeta"]
+            for p in columnas_num: 
+                nuevas_columnas.extend([f"{p} (Media)", f"{p} (Desv. Est.)"])
+            df_resumen.columns = nuevas_columnas
+            
+            self.df_resumen_actual = df_resumen.copy()
+            self.columnas_extraidas = columnas_num
+            
+            try:
+                # Estilos para el formateo condicional del Excel
+                fondo_rojo = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                fondo_verde = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+                with pd.ExcelWriter(self.archivo_destino, engine='openpyxl') as writer:
+                    df_resumen.to_excel(writer, sheet_name='Resumen Global', index=False)
+                    df_bruto.to_excel(writer, sheet_name='Matriz Bruta', index=False)
+                    
+                    zonas_unicas = df_bruto['Zona / Carpeta'].unique()
+                    for zona in zonas_unicas:
+                        df_zona = df_bruto[df_bruto['Zona / Carpeta'] == zona].drop(columns=['Zona / Carpeta'])
+                        medias_zona = df_zona[columnas_num].mean()
+                        
+                        fila_medias = {'Nombre del Archivo': 'VALORES MEDIOS'}
+                        for col in columnas_num: 
+                            fila_medias[col] = medias_zona[col]
+                            
+                        df_zona_final = pd.concat([df_zona, pd.DataFrame([fila_medias])], ignore_index=True)
+                        df_zona_final.to_excel(writer, sheet_name=str(zona)[:31], index=False)
+                    
+                    # Aplicación de colores (Control de Tolerancias)
+                    for nombre_hoja in writer.sheets:
+                        hoja = writer.sheets[nombre_hoja]
+                        col_parametros = {}
+                        
+                        for col_idx, celda in enumerate(hoja[1], 1): 
+                            nombre_columna = str(celda.value)
+                            for param, maximo in self.tolerancias_max.items():
+                                if nombre_columna == param or nombre_columna == f"{param} (Media)":
+                                    col_parametros[col_idx] = maximo
+
+                        for columna in hoja.columns:
+                            col_letra = columna[0].column_letter
+                            col_idx = columna[0].column
+                            max_longitud = 0
+                            
+                            for celda in columna:
+                                if celda.value is not None:
+                                    if len(str(celda.value)) > max_longitud: 
+                                        max_longitud = len(str(celda.value))
+                                
+                                if celda.row > 1 and col_idx in col_parametros:
+                                    limite = col_parametros[col_idx]
+                                    if isinstance(celda.value, (int, float)):
+                                        if celda.value > limite: 
+                                            celda.fill = fondo_rojo
+                                        else: 
+                                            celda.fill = fondo_verde
+
+                            hoja.column_dimensions[col_letra].width = (max_longitud + 4) 
+
+                self.after(0, lambda: self.finalizar_extraccion(True, f"Análisis topográfico finalizado con éxito.\nRegistros procesados: {total_pdfs}."))
+            except Exception as e:
+                self.after(0, lambda: self.finalizar_extraccion(False, f"Fallo en la persistencia del archivo Excel.\n{e}"))
+
+    def actualizar_barra(self, progreso, texto):
+        self.barra_progreso.set(progreso)
+        self.lbl_progreso.configure(text=texto)
+
+    def finalizar_extraccion(self, exito, mensaje):
+        """Restaura los controles de la interfaz tras finalizar el procesado."""
+        self.barra_progreso.pack_forget()
+        self.lbl_progreso.pack_forget()
+        self.btn_ejecutar.configure(state="normal", text="3. INICIAR EXTRACCIÓN")
+        
+        if exito:
+            self.combo_parametros.configure(state="normal", values=self.columnas_extraidas)
+            self.combo_parametros.set(self.columnas_extraidas[0]) 
+            self.btn_grafico.configure(state="normal")
+            self.btn_abrir_excel.configure(state="normal")
+            self.btn_pdf.configure(state="normal") 
+            self.btn_abrir_carpeta_dest.configure(state="normal") 
+            
+            self.registrar_log(f"\nOperación completada. Base de datos guardada en: {self.archivo_destino}")
+            messagebox.showinfo("Proceso Terminado", mensaje)
+        else:
+            self.registrar_log(f"\n[X] Advertencia del sistema: {mensaje}")
+            messagebox.showerror("Error", mensaje)
+
+    def mostrar_grafico(self):
+        """Renderiza en pantalla una gráfica comparativa de zonas para un parámetro específico."""
+        if self.df_resumen_actual is None: 
+            return
+            
+        parametro = self.combo_parametros.get()
+        columna_media = f"{parametro} (Media)" 
+        datos_limpios = self.df_resumen_actual.dropna(subset=[columna_media])
+        zonas, medias = datos_limpios["Zona / Carpeta"], datos_limpios[columna_media]
+        
+        plt.figure(figsize=(10, 6))
+        barras = plt.bar(zonas, medias, color='#4da6ff', edgecolor='black', linewidth=1.2)
+        
+        for barra in barras: 
+            yval = barra.get_height()
+            plt.text(barra.get_x() + barra.get_width() / 2, yval, 
+                     round(yval, 3), ha='center', va='bottom', 
+                     fontsize=10, fontweight='bold')
+        
+        if parametro in self.tolerancias_max:
+            limite = self.tolerancias_max[parametro]
+            plt.axhline(y=limite, color='r', linestyle='--', linewidth=2, 
+                        label=f'Límite Máximo ({limite} µm)')
+            plt.legend()
+
+        plt.title(f"Análisis comparativo de '{parametro}' entre zonas de fresado", fontsize=14, fontweight='bold')
+        plt.xticks(rotation=45, ha='right') 
+        plt.grid(axis='y', linestyle='--', alpha=0.7) 
+        plt.tight_layout() 
+        plt.show() 
+
+# Lanzamiento de la aplicación
+if __name__ == "__main__":
+    app = AliconaApp()
+    app.mainloop()
